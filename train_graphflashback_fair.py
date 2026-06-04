@@ -502,6 +502,61 @@ def make_scheduler(torch, args, optimizer):
     raise ValueError(f"unsupported lr scheduler: {args.lr_scheduler}")
 
 
+def configure_cudnn(torch, args):
+    if bool(args.enable_cudnn):
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+    else:
+        torch.backends.cudnn.enabled = False
+        torch.backends.cudnn.benchmark = False
+
+
+def is_cudnn_runtime_mismatch(exc):
+    text = str(exc).lower()
+    return "cudnn" in text and (
+        "version incompatibility" in text
+        or "runtime version" in text
+        or "ld_library_path" in text
+        or "cudnn_status" in text
+    )
+
+
+def build_model_on_device(torch, ModelClass, loc_count, data, args, transition_graph, spatial_graph, friend_graph, interact_graph, device):
+    try:
+        return ModelClass(
+            loc_count,
+            data["num_users"],
+            data["num_rels"],
+            args,
+            transition_graph,
+            spatial_graph,
+            friend_graph,
+            interact_graph,
+        ).to(device)
+    except RuntimeError as exc:
+        if device.type != "cuda" or not bool(args.enable_cudnn) or not is_cudnn_runtime_mismatch(exc):
+            raise
+        print(
+            "[GraphFlashback-Fair] WARNING: cuDNN initialization failed; disabling cuDNN and "
+            "rebuilding the GRU/RNN model. This usually means LD_LIBRARY_PATH exposes an "
+            "incompatible system cuDNN before PyTorch's bundled cuDNN.",
+            flush=True,
+        )
+        args.enable_cudnn = False
+        args.cudnn_benchmark = False
+        configure_cudnn(torch, args)
+        return ModelClass(
+            loc_count,
+            data["num_users"],
+            data["num_rels"],
+            args,
+            transition_graph,
+            spatial_graph,
+            friend_graph,
+            interact_graph,
+        ).to(device)
+
+
 def train_one_epoch(torch, nn, args, model, loader, optimizer, scheduler, device, epoch):
     model.train()
     criterion = nn.CrossEntropyLoss().to(device)
@@ -608,12 +663,7 @@ def run(args):
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() and int(args.gpu) >= 0 else "cpu")
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    if bool(args.enable_cudnn):
-        torch.backends.cudnn.enabled = True
-        torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
-    else:
-        torch.backends.cudnn.enabled = False
-        torch.backends.cudnn.benchmark = False
+    configure_cudnn(torch, args)
 
     data = load_datasets(args.dataset, q=args.ns_q, load_train_ratio=args.train_predict_ratio, load_eval_neg=True, ns_seed=args.ns_seed)
     if not data.get("is_thg", False):
@@ -635,7 +685,18 @@ def run(args):
     loc_count = int(data["num_businesses"]) + 1
     args.max_time_norm = int(data["timestamps_norm_max"])
     ModelClass = make_model_class(torch, nn, Flashback, RnnFactory)
-    model = ModelClass(loc_count, data["num_users"], data["num_rels"], args, transition_graph, spatial_graph, friend_graph, interact_graph).to(device)
+    model = build_model_on_device(
+        torch,
+        ModelClass,
+        loc_count,
+        data,
+        args,
+        transition_graph,
+        spatial_graph,
+        friend_graph,
+        interact_graph,
+        device,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     scheduler = make_scheduler(torch, args, optimizer)
 
